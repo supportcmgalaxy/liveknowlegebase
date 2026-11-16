@@ -1153,14 +1153,120 @@ foreach (array('category', 'doc_dir') as $tax) {
     add_filter("manage_{$tax}_custom_column", function($content, $column_name, $term_id) {
         if ($column_name === 'cmg_cat_access') {
             $val = get_term_meta($term_id, '_cmg_cat_restricted', true);
-            if ($val === 'logged_in_only') {
-                return '<span style="display:inline-block; background:#fee2e2; color:#b91c1c; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px;">🔒 Logged-in Only</span>';
-            }
-            return '<span style="display:inline-block; background:#dcfce7; color:#15803d; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px;">🌐 Public</span>';
+            $is_locked = ($val === 'logged_in_only' || $val === '1');
+            $label = $is_locked ? '🔒 Logged-in Only' : '🌐 Public';
+            $btn_bg = $is_locked ? '#fee2e2' : '#dcfce7';
+            $btn_border = $is_locked ? '#fca5a5' : '#86efac';
+            $btn_color = $is_locked ? '#b91c1c' : '#15803d';
+            $title = $is_locked ? 'Click to make Public' : 'Click to Restrict to Logged-in Only';
+
+            return sprintf(
+                '<button type="button" class="button button-small cmg-cat-toggle-btn" data-term-id="%d" data-status="%s" style="background:%s; border-color:%s; color:%s; font-weight:600; cursor:pointer; min-width:115px; text-align:center; transition:all 0.2s;" title="%s">%s</button>',
+                intval($term_id),
+                esc_attr($is_locked ? 'logged_in_only' : 'none'),
+                esc_attr($btn_bg),
+                esc_attr($btn_border),
+                esc_attr($btn_color),
+                esc_attr($title),
+                esc_html($label)
+            );
         }
         return $content;
     }, 10, 3);
+
+    // 1b. Bulk Actions for Categories (edit-category and edit-doc_dir)
+    add_filter("bulk_actions-edit-{$tax}", function($bulk_actions) {
+        $bulk_actions['cmg_cat_bulk_lock']   = '🔒 Restrict to Logged-in Only';
+        $bulk_actions['cmg_cat_bulk_unlock'] = '🌐 Make Public (Free Access)';
+        return $bulk_actions;
+    });
+
+    add_filter("handle_bulk_actions-edit-{$tax}", function($redirect_to, $doaction, $term_ids) {
+        if (!in_array($doaction, array('cmg_cat_bulk_lock', 'cmg_cat_bulk_unlock'))) {
+            return $redirect_to;
+        }
+
+        $val = ($doaction === 'cmg_cat_bulk_lock') ? 'logged_in_only' : 'none';
+        $count = 0;
+        foreach ((array)$term_ids as $tid) {
+            $tid = intval($tid);
+            update_term_meta($tid, '_cmg_cat_restricted', $val);
+            $count++;
+        }
+
+        // Clean redirect URL completely to prevent 414 Request-URI Too Long
+        $redirect_to = remove_query_arg(array('delete_tags', 'action', 'action2', '_wpnonce', '_wp_http_referer'), $redirect_to);
+        $redirect_to = add_query_arg('cmg_cat_bulk_done', $count, $redirect_to);
+        $redirect_to = add_query_arg('cmg_cat_bulk_type', $doaction, $redirect_to);
+        return $redirect_to;
+    }, 10, 3);
 }
+
+// AJAX handler for 1-click category access toggle
+add_action('wp_ajax_cmg_toggle_category_access', function() {
+    check_ajax_referer('cmg_cat_toggle_nonce', 'nonce');
+    if (!current_user_can('manage_categories')) {
+        wp_send_json_error(array('message' => 'Unauthorized'));
+    }
+    $term_id = isset($_POST['term_id']) ? intval($_POST['term_id']) : 0;
+    if (!$term_id) {
+        wp_send_json_error(array('message' => 'Invalid category ID'));
+    }
+
+    $current = get_term_meta($term_id, '_cmg_cat_restricted', true);
+    $new_status = ($current === 'logged_in_only' || $current === '1') ? 'none' : 'logged_in_only';
+    update_term_meta($term_id, '_cmg_cat_restricted', $new_status);
+
+    $is_locked = ($new_status === 'logged_in_only');
+    wp_send_json_success(array(
+        'term_id'    => $term_id,
+        'new_status' => $new_status,
+        'label'      => $is_locked ? '🔒 Logged-in Only' : '🌐 Public',
+        'bg'         => $is_locked ? '#fee2e2' : '#dcfce7',
+        'border'     => $is_locked ? '#fca5a5' : '#86efac',
+        'color'      => $is_locked ? '#b91c1c' : '#15803d',
+        'title'      => $is_locked ? 'Click to make Public' : 'Click to Restrict to Logged-in Only'
+    ));
+});
+
+// Admin footer script for category toggle
+add_action('admin_footer-edit-tags.php', function() {
+    ?>
+    <script type="text/javascript">
+    jQuery(document).ready(function($) {
+        $(document).on('click', '.cmg-cat-toggle-btn', function(e) {
+            e.preventDefault();
+            var $btn = $(this);
+            var termId = $btn.data('term-id');
+            $btn.text('Updating...').css('opacity', 0.6);
+            $.post(ajaxurl, {
+                action: 'cmg_toggle_category_access',
+                term_id: termId,
+                nonce: '<?php echo wp_create_nonce("cmg_cat_toggle_nonce"); ?>'
+            }, function(res) {
+                if (res && res.success) {
+                    $btn.text(res.data.label)
+                        .css({
+                            'background': res.data.bg,
+                            'border-color': res.data.border,
+                            'color': res.data.color,
+                            'opacity': 1
+                        })
+                        .attr('title', res.data.title)
+                        .data('status', res.data.new_status);
+                } else {
+                    alert('Error updating category access');
+                    $btn.css('opacity', 1);
+                }
+            }).fail(function() {
+                alert('Request failed');
+                $btn.css('opacity', 1);
+            });
+        });
+    });
+    </script>
+    <?php
+});
 
 // -------------------------------------------------------------------------
 // 2. Posts List Table: Add 'Access' Column to Admin Posts & Docs list
@@ -1231,7 +1337,7 @@ add_action('admin_head', function() {
 });
 
 // -------------------------------------------------------------------------
-// 2b. Direct Bulk Actions Dropdown (e.g. Bulk Actions > Restrict to Logged-in)
+// 2b. Direct Bulk Actions Dropdown for Posts
 // -------------------------------------------------------------------------
 foreach (array('post', 'docs') as $cpt) {
     add_filter("bulk_actions-edit-{$cpt}", function($bulk_actions) {
@@ -1254,20 +1360,22 @@ foreach (array('post', 'docs') as $cpt) {
 
         $access = $access_map[$doaction];
         $count = 0;
-        foreach ($post_ids as $pid) {
+        foreach ((array)$post_ids as $pid) {
             if (current_user_can('edit_post', $pid)) {
                 cmg_set_post_restriction($pid, $access);
                 $count++;
             }
         }
 
+        // Clean redirect URL completely to prevent 414 Request-URI Too Long
+        $redirect_to = remove_query_arg(array('post', 'action', 'action2', '_wpnonce', '_wp_http_referer', 'bulk_edit'), $redirect_to);
         $redirect_to = add_query_arg('cmg_bulk_done', $count, $redirect_to);
         $redirect_to = add_query_arg('cmg_bulk_action_type', $doaction, $redirect_to);
         return $redirect_to;
     }, 10, 3);
 }
 
-// Admin notice for direct bulk actions
+// Admin notices for direct bulk actions (Posts & Categories)
 add_action('admin_notices', function() {
     if (!empty($_GET['cmg_bulk_done'])) {
         $count = intval($_GET['cmg_bulk_done']);
@@ -1281,6 +1389,13 @@ add_action('admin_notices', function() {
             $label = 'set to Inherit from Category 📁';
         }
         echo '<div class="notice notice-success is-dismissible"><p><strong>Success:</strong> ' . esc_html($count) . ' articles successfully ' . esc_html($label) . '.</p></div>';
+    }
+
+    if (!empty($_GET['cmg_cat_bulk_done'])) {
+        $count = intval($_GET['cmg_cat_bulk_done']);
+        $action_type = isset($_GET['cmg_cat_bulk_action_type']) ? sanitize_text_field($_GET['cmg_cat_bulk_action_type']) : '';
+        $label = ($action_type === 'cmg_cat_bulk_lock') ? 'restricted to Logged-in Users Only 🔒' : 'made Public (Free Access) 🌐';
+        echo '<div class="notice notice-success is-dismissible"><p><strong>Success:</strong> ' . esc_html($count) . ' categories successfully ' . esc_html($label) . '.</p></div>';
     }
 });
 
