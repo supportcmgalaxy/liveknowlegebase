@@ -168,7 +168,6 @@ while ( have_posts() ) : the_post();
                     }
                 })();
                 </script>
-            <?php endif; ?>
 
                 <div class="col-lg-10 anchor-enabled">
                 <?php endif; ?>
