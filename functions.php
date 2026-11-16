@@ -749,6 +749,20 @@ function cmg_is_post_restricted_to_logged_in($post_id = null) {
         return false;
     }
 
+    // 1. Explicit post-level override takes highest priority
+    $override = get_post_meta($post_id, '_cmg_post_access_override', true);
+    if ($override === 'always_public') {
+        return false; // Free / Public even if category is restricted
+    }
+    if ($override === 'logged_in_only') {
+        return true;  // Explicitly restricted
+    }
+
+    // 2. Check if the post's Category (or doc_dir) is restricted
+    if (function_exists('cmg_is_post_in_restricted_category') && cmg_is_post_in_restricted_category($post_id)) {
+        return true;
+    }
+
     $rbcr_logged_in_only = get_post_meta($post_id, '_rbcr_logged_in_only', true);
     if ($rbcr_logged_in_only === '1' || $rbcr_logged_in_only === 1 || $rbcr_logged_in_only === true) {
         return true;
@@ -1005,4 +1019,306 @@ add_filter('template_include', function($template) {
 
     return $template;
 }, 99);
+
+/**
+ * =========================================================================
+ * CMGalaxy Admin: Category-wise & Post-level Access Restriction System
+ * =========================================================================
+ */
+
+// Check if a category (or any parent category) is restricted
+function cmg_is_category_restricted($term_id, $taxonomy = 'category') {
+    if (!$term_id) return false;
+    $val = get_term_meta($term_id, '_cmg_cat_restricted', true);
+    if ($val === 'logged_in_only' || $val === '1') {
+        return true;
+    }
+    if ($taxonomy && taxonomy_exists($taxonomy)) {
+        $ancestors = get_ancestors($term_id, $taxonomy);
+        if (!empty($ancestors)) {
+            foreach ($ancestors as $anc_id) {
+                $anc_val = get_term_meta($anc_id, '_cmg_cat_restricted', true);
+                if ($anc_val === 'logged_in_only' || $anc_val === '1') {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Check if post belongs to any restricted category
+function cmg_is_post_in_restricted_category($post_id) {
+    if (!$post_id) return false;
+    foreach (array('category', 'doc_dir') as $taxonomy) {
+        if (!taxonomy_exists($taxonomy)) continue;
+        $terms = get_the_terms($post_id, $taxonomy);
+        if (!empty($terms) && !is_wp_error($terms)) {
+            foreach ($terms as $term) {
+                if (cmg_is_category_restricted($term->term_id, $taxonomy)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// Helper to update restriction meta for a post
+function cmg_set_post_restriction($post_id, $access) {
+    if (!$post_id || empty($access) || $access === '-1') {
+        return;
+    }
+    if ($access === 'logged_in_only') {
+        update_post_meta($post_id, '_cmg_post_access_override', 'logged_in_only');
+        update_post_meta($post_id, '_rbcr_login_status', 'logged_in_only');
+        update_post_meta($post_id, '_rbcr_logged_in_only', '1');
+        update_post_meta($post_id, '_content_control_user_status', 'logged_in');
+    } elseif ($access === 'always_public') {
+        update_post_meta($post_id, '_cmg_post_access_override', 'always_public');
+        update_post_meta($post_id, '_rbcr_login_status', '');
+        update_post_meta($post_id, '_rbcr_logged_in_only', '0');
+        delete_post_meta($post_id, '_rbcr_login_status');
+        delete_post_meta($post_id, '_rbcr_logged_in_only');
+        delete_post_meta($post_id, '_content_control_user_status');
+        delete_post_meta($post_id, '_content_control_post_restricted');
+        delete_post_meta($post_id, '_content_control_who');
+        delete_post_meta($post_id, '_content_control_restriction_type');
+    } elseif ($access === 'inherit') {
+        delete_post_meta($post_id, '_cmg_post_access_override');
+        update_post_meta($post_id, '_rbcr_login_status', '');
+        update_post_meta($post_id, '_rbcr_logged_in_only', '0');
+        delete_post_meta($post_id, '_rbcr_login_status');
+        delete_post_meta($post_id, '_rbcr_logged_in_only');
+        delete_post_meta($post_id, '_content_control_user_status');
+        delete_post_meta($post_id, '_content_control_post_restricted');
+        delete_post_meta($post_id, '_content_control_who');
+        delete_post_meta($post_id, '_content_control_restriction_type');
+    }
+}
+
+// -------------------------------------------------------------------------
+// 1. Category Screen: Add Access setting to Posts > Categories
+// -------------------------------------------------------------------------
+foreach (array('category', 'doc_dir') as $tax) {
+    // Add field on 'Add Category' screen
+    add_action("{$tax}_add_form_fields", function() {
+        ?>
+        <div class="form-field term-access-wrap">
+            <label for="cmg_cat_restricted"><?php esc_html_e('Category Access / Restriction', 'docy'); ?></label>
+            <select name="cmg_cat_restricted" id="cmg_cat_restricted" style="max-width:320px;">
+                <option value="none">🌐 Public (Free for all visitors)</option>
+                <option value="logged_in_only">🔒 Restrict All Articles in this Category (Logged-in Only)</option>
+            </select>
+            <p class="description"><?php esc_html_e('If restricted, all articles in this category will require users to log in, unless an individual article is set to "Always Public".', 'docy'); ?></p>
+        </div>
+        <?php
+    });
+
+    // Add field on 'Edit Category' screen
+    add_action("{$tax}_edit_form_fields", function($term) {
+        $term_id = $term->term_id;
+        $val = get_term_meta($term_id, '_cmg_cat_restricted', true);
+        if (!$val) $val = 'none';
+        ?>
+        <tr class="form-field term-access-wrap">
+            <th scope="row"><label for="cmg_cat_restricted"><?php esc_html_e('Category Access / Restriction', 'docy'); ?></label></th>
+            <td>
+                <select name="cmg_cat_restricted" id="cmg_cat_restricted" style="max-width:340px;">
+                    <option value="none" <?php selected($val, 'none'); ?>>🌐 Public (Free for all visitors)</option>
+                    <option value="logged_in_only" <?php selected($val, 'logged_in_only'); ?>>🔒 Restrict All Articles in this Category (Logged-in Only)</option>
+                </select>
+                <p class="description"><?php esc_html_e('If restricted, all articles in this category will require users to log in, unless an individual article is set to "Always Public".', 'docy'); ?></p>
+            </td>
+        </tr>
+        <?php
+    });
+
+    // Save category setting
+    $save_cat_callback = function($term_id) {
+        if (isset($_POST['cmg_cat_restricted'])) {
+            $val = sanitize_text_field($_POST['cmg_cat_restricted']);
+            update_term_meta($term_id, '_cmg_cat_restricted', $val);
+        }
+    };
+    add_action("created_{$tax}", $save_cat_callback);
+    add_action("edited_{$tax}", $save_cat_callback);
+
+    // Add column in Categories list table
+    add_filter("manage_edit-{$tax}_columns", function($columns) {
+        $columns['cmg_cat_access'] = esc_html__('Access', 'docy');
+        return $columns;
+    });
+
+    add_filter("manage_{$tax}_custom_column", function($content, $column_name, $term_id) {
+        if ($column_name === 'cmg_cat_access') {
+            $val = get_term_meta($term_id, '_cmg_cat_restricted', true);
+            if ($val === 'logged_in_only') {
+                return '<span style="display:inline-block; background:#fee2e2; color:#b91c1c; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px;">🔒 Logged-in Only</span>';
+            }
+            return '<span style="display:inline-block; background:#dcfce7; color:#15803d; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px;">🌐 Public</span>';
+        }
+        return $content;
+    }, 10, 3);
+}
+
+// -------------------------------------------------------------------------
+// 2. Posts List Table: Add 'Access' Column to Admin Posts & Docs list
+// -------------------------------------------------------------------------
+foreach (array('post', 'docs') as $cpt) {
+    add_filter("manage_{$cpt}_posts_columns", function($columns) {
+        $new_columns = array();
+        foreach ($columns as $key => $title) {
+            $new_columns[$key] = $title;
+            if ($key === 'title') {
+                $new_columns['cmg_access_restriction'] = esc_html__('Access', 'docy');
+            }
+        }
+        if (!isset($new_columns['cmg_access_restriction'])) {
+            $new_columns['cmg_access_restriction'] = esc_html__('Access', 'docy');
+        }
+        return $new_columns;
+    });
+
+    add_action("manage_{$cpt}_posts_custom_column", function($column_name, $post_id) {
+        if ($column_name === 'cmg_access_restriction') {
+            $override = get_post_meta($post_id, '_cmg_post_access_override', true);
+            $cat_restricted = cmg_is_post_in_restricted_category($post_id);
+            $is_restricted = cmg_is_post_restricted_to_logged_in($post_id);
+
+            // Stored value for JS Quick Edit
+            $val_slug = !empty($override) ? $override : 'inherit';
+            echo '<span class="cmg-access-val" style="display:none;">' . esc_attr($val_slug) . '</span>';
+
+            if ($override === 'always_public') {
+                echo '<span style="display:inline-block; background:#dcfce7; color:#15803d; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;">🌐 Always Public</span>';
+            } elseif ($override === 'logged_in_only') {
+                echo '<span style="display:inline-block; background:#fee2e2; color:#b91c1c; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;">🔒 Logged-in (Forced)</span>';
+            } else {
+                // Inherited
+                if ($cat_restricted || $is_restricted) {
+                    echo '<span style="display:inline-block; background:#fef3c7; color:#92400e; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;" title="Inherited from Category">🔒 Logged-in (Category)</span>';
+                } else {
+                    echo '<span style="display:inline-block; background:#f1f5f9; color:#475569; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;" title="Inherited from Category">🌐 Public (Default)</span>';
+                }
+            }
+        }
+    }, 10, 2);
+}
+
+// -------------------------------------------------------------------------
+// 3. Quick Edit Dropdown
+// -------------------------------------------------------------------------
+add_action('quick_edit_custom_box', function($column_name, $post_type) {
+    if ($column_name !== 'cmg_access_restriction') {
+        return;
+    }
+    wp_nonce_field('cmg_quick_edit_nonce', 'cmg_quick_edit_nonce_field');
+    ?>
+    <fieldset class="inline-edit-col-right" style="margin-top:6px;">
+        <div class="inline-edit-col">
+            <label class="alignleft" style="display:flex; align-items:center; gap:8px;">
+                <span class="title" style="width:120px; font-weight:600;"><?php esc_html_e('Restrict Access', 'docy'); ?></span>
+                <select name="cmg_quick_restrict_access" id="cmg_quick_restrict_access" style="max-width:280px;">
+                    <option value="inherit">📁 Inherit from Category (Default)</option>
+                    <option value="logged_in_only">🔒 Restrict to Logged-in Users Only</option>
+                    <option value="always_public">🌐 Always Public (Free Access)</option>
+                </select>
+            </label>
+        </div>
+    </fieldset>
+    <?php
+}, 10, 2);
+
+// -------------------------------------------------------------------------
+// 4. Bulk Edit Dropdown
+// -------------------------------------------------------------------------
+add_action('bulk_edit_custom_box', function($column_name, $post_type) {
+    if ($column_name !== 'cmg_access_restriction') {
+        return;
+    }
+    wp_nonce_field('cmg_bulk_edit_nonce', 'cmg_bulk_edit_nonce_field');
+    ?>
+    <fieldset class="inline-edit-col-right" style="margin-top:6px;">
+        <div class="inline-edit-col">
+            <label class="alignleft" style="display:flex; align-items:center; gap:8px;">
+                <span class="title" style="width:120px; font-weight:600;"><?php esc_html_e('Restrict Access', 'docy'); ?></span>
+                <select name="cmg_bulk_restrict_access" id="cmg_bulk_restrict_access" style="max-width:280px;">
+                    <option value="-1">— <?php esc_html_e('No Change', 'docy'); ?> —</option>
+                    <option value="inherit">📁 Inherit from Category (Default)</option>
+                    <option value="logged_in_only">🔒 Restrict to Logged-in Users Only</option>
+                    <option value="always_public">🌐 Always Public (Free Access)</option>
+                </select>
+            </label>
+        </div>
+    </fieldset>
+    <?php
+}, 10, 2);
+
+// -------------------------------------------------------------------------
+// 5. Save Bulk Edit updates
+// -------------------------------------------------------------------------
+add_action('load-edit.php', function() {
+    if (isset($_REQUEST['cmg_bulk_restrict_access']) && $_REQUEST['cmg_bulk_restrict_access'] !== '-1') {
+        $access = sanitize_text_field($_REQUEST['cmg_bulk_restrict_access']);
+        $post_ids = isset($_REQUEST['post']) ? array_map('intval', (array)$_REQUEST['post']) : array();
+        
+        if (!empty($post_ids)) {
+            foreach ($post_ids as $pid) {
+                if (!current_user_can('edit_post', $pid)) {
+                    continue;
+                }
+                cmg_set_post_restriction($pid, $access);
+            }
+        }
+    }
+});
+
+// -------------------------------------------------------------------------
+// 6. Save Quick Edit updates & single save
+// -------------------------------------------------------------------------
+add_action('save_post', function($post_id) {
+    if (defined('DOING_AUTOSAVE') && DOING_AUTOSAVE) return;
+    if (!current_user_can('edit_post', $post_id)) return;
+
+    if (isset($_POST['cmg_quick_restrict_access']) && isset($_POST['cmg_quick_edit_nonce_field']) && wp_verify_nonce($_POST['cmg_quick_edit_nonce_field'], 'cmg_quick_edit_nonce')) {
+        $access = sanitize_text_field($_POST['cmg_quick_restrict_access']);
+        cmg_set_post_restriction($post_id, $access);
+    } elseif (isset($_REQUEST['cmg_bulk_restrict_access']) && $_REQUEST['cmg_bulk_restrict_access'] !== '-1') {
+        $access = sanitize_text_field($_REQUEST['cmg_bulk_restrict_access']);
+        cmg_set_post_restriction($post_id, $access);
+    }
+}, 10, 1);
+
+// -------------------------------------------------------------------------
+// 7. Admin JS to populate Quick Edit dropdown with existing value
+// -------------------------------------------------------------------------
+add_action('admin_footer-edit.php', function() {
+    ?>
+    <script type="text/javascript">
+    jQuery(document).ready(function($) {
+        if (typeof inlineEditPost !== 'undefined') {
+            var original_inline_edit = inlineEditPost.edit;
+            inlineEditPost.edit = function(id) {
+                original_inline_edit.apply(this, arguments);
+                var postId = 0;
+                if (typeof(id) === 'object') {
+                    postId = parseInt(this.getId(id));
+                }
+                if (postId > 0) {
+                    var $editRow = $('#edit-' + postId);
+                    var $postRow = $('#post-' + postId);
+                    var accessVal = $postRow.find('.cmg-access-val').text().trim();
+                    if (accessVal) {
+                        $editRow.find('select[name="cmg_quick_restrict_access"]').val(accessVal);
+                    }
+                }
+            };
+        }
+    });
+    </script>
+    <?php
+});
+
+
 
