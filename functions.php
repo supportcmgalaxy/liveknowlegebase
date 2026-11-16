@@ -1169,10 +1169,10 @@ foreach (array('post', 'docs') as $cpt) {
     add_filter("manage_{$cpt}_posts_columns", function($columns) {
         $new_columns = array();
         foreach ($columns as $key => $title) {
-            $new_columns[$key] = $title;
-            if ($key === 'title') {
+            if ($key === 'date') {
                 $new_columns['cmg_access_restriction'] = esc_html__('Access', 'docy');
             }
+            $new_columns[$key] = $title;
         }
         if (!isset($new_columns['cmg_access_restriction'])) {
             $new_columns['cmg_access_restriction'] = esc_html__('Access', 'docy');
@@ -1191,20 +1191,98 @@ foreach (array('post', 'docs') as $cpt) {
             echo '<span class="cmg-access-val" style="display:none;">' . esc_attr($val_slug) . '</span>';
 
             if ($override === 'always_public') {
-                echo '<span style="display:inline-block; background:#dcfce7; color:#15803d; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;">🌐 Always Public</span>';
+                echo '<span style="display:inline-block; background:#dcfce7; color:#15803d; padding:4px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2; white-space:nowrap;">🌐 Always Public</span>';
             } elseif ($override === 'logged_in_only') {
-                echo '<span style="display:inline-block; background:#fee2e2; color:#b91c1c; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;">🔒 Logged-in (Forced)</span>';
+                echo '<span style="display:inline-block; background:#fee2e2; color:#b91c1c; padding:4px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2; white-space:nowrap;">🔒 Logged-in Only</span>';
             } else {
                 // Inherited
                 if ($cat_restricted || $is_restricted) {
-                    echo '<span style="display:inline-block; background:#fef3c7; color:#92400e; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;" title="Inherited from Category">🔒 Logged-in (Category)</span>';
+                    echo '<span style="display:inline-block; background:#fef3c7; color:#92400e; padding:4px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2; white-space:nowrap;" title="Inherited from Category">🔒 Logged-in (Cat)</span>';
                 } else {
-                    echo '<span style="display:inline-block; background:#f1f5f9; color:#475569; padding:3px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2;" title="Inherited from Category">🌐 Public (Default)</span>';
+                    echo '<span style="display:inline-block; background:#f1f5f9; color:#475569; padding:4px 8px; border-radius:4px; font-weight:600; font-size:11px; line-height:1.2; white-space:nowrap;" title="Inherited from Category">🌐 Public (Cat)</span>';
                 }
             }
         }
     }, 10, 2);
 }
+
+// Fix table CSS so Title and Access columns are never squished
+add_action('admin_head', function() {
+    $screen = get_current_screen();
+    if ($screen && in_array($screen->post_type, array('post', 'docs')) && $screen->base === 'edit') {
+        ?>
+        <style>
+            .wp-list-table th.column-title, 
+            .wp-list-table td.column-title {
+                width: 25% !important;
+                min-width: 220px !important;
+            }
+            .wp-list-table th.column-cmg_access_restriction, 
+            .wp-list-table td.column-cmg_access_restriction {
+                width: 140px !important;
+                min-width: 130px !important;
+                text-align: center !important;
+                vertical-align: middle !important;
+                white-space: nowrap !important;
+            }
+        </style>
+        <?php
+    }
+});
+
+// -------------------------------------------------------------------------
+// 2b. Direct Bulk Actions Dropdown (e.g. Bulk Actions > Restrict to Logged-in)
+// -------------------------------------------------------------------------
+foreach (array('post', 'docs') as $cpt) {
+    add_filter("bulk_actions-edit-{$cpt}", function($bulk_actions) {
+        $bulk_actions['cmg_bulk_lock']    = '🔒 Restrict to Logged-in Only';
+        $bulk_actions['cmg_bulk_unlock']  = '🌐 Make Public (Free Access)';
+        $bulk_actions['cmg_bulk_inherit'] = '📁 Inherit from Category';
+        return $bulk_actions;
+    });
+
+    add_filter("handle_bulk_actions-edit-{$cpt}", function($redirect_to, $doaction, $post_ids) {
+        if (!in_array($doaction, array('cmg_bulk_lock', 'cmg_bulk_unlock', 'cmg_bulk_inherit'))) {
+            return $redirect_to;
+        }
+
+        $access_map = array(
+            'cmg_bulk_lock'    => 'logged_in_only',
+            'cmg_bulk_unlock'  => 'always_public',
+            'cmg_bulk_inherit' => 'inherit',
+        );
+
+        $access = $access_map[$doaction];
+        $count = 0;
+        foreach ($post_ids as $pid) {
+            if (current_user_can('edit_post', $pid)) {
+                cmg_set_post_restriction($pid, $access);
+                $count++;
+            }
+        }
+
+        $redirect_to = add_query_arg('cmg_bulk_done', $count, $redirect_to);
+        $redirect_to = add_query_arg('cmg_bulk_action_type', $doaction, $redirect_to);
+        return $redirect_to;
+    }, 10, 3);
+}
+
+// Admin notice for direct bulk actions
+add_action('admin_notices', function() {
+    if (!empty($_GET['cmg_bulk_done'])) {
+        $count = intval($_GET['cmg_bulk_done']);
+        $action_type = isset($_GET['cmg_bulk_action_type']) ? sanitize_text_field($_GET['cmg_bulk_action_type']) : '';
+        $label = 'updated';
+        if ($action_type === 'cmg_bulk_lock') {
+            $label = 'restricted to Logged-in Users Only 🔒';
+        } elseif ($action_type === 'cmg_bulk_unlock') {
+            $label = 'made Public (Free Access) 🌐';
+        } elseif ($action_type === 'cmg_bulk_inherit') {
+            $label = 'set to Inherit from Category 📁';
+        }
+        echo '<div class="notice notice-success is-dismissible"><p><strong>Success:</strong> ' . esc_html($count) . ' articles successfully ' . esc_html($label) . '.</p></div>';
+    }
+});
 
 // -------------------------------------------------------------------------
 // 3. Quick Edit Dropdown
